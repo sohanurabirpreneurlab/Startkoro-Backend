@@ -27,6 +27,12 @@ export const createAdminRoutes = (adminController: AdminController): Router => {
     upload.single('file'),
     asyncHandler(adminController.uploadKnowledgeFile)
   );
+  router.get(
+    '/knowledge/upload/:batchId/progress',
+    authMiddleware,
+    adminMiddleware,
+    asyncHandler(adminController.getUploadProgress)
+  );
 
   return router;
 };

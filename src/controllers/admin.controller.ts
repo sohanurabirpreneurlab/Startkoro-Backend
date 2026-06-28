@@ -12,6 +12,10 @@ const updateUserRoleParamsSchema = z.object({
   userId: z.string().uuid()
 });
 
+const uploadProgressParamsSchema = z.object({
+  batchId: z.string().uuid()
+});
+
 const updateUserRoleBodySchema = z.object({
   role: z.enum(['user', 'admin'])
 });
@@ -62,7 +66,23 @@ export class AdminController {
 
     res.status(200).json({
       success: true,
-      message: 'Knowledge file processed successfully',
+      message: 'Knowledge upload started',
+      data: result
+    });
+  };
+
+  getUploadProgress = async (req: IAuthenticatedRequest, res: Response): Promise<void> => {
+    const adminUserId = req.user?.sub;
+
+    if (!adminUserId) {
+      throw new AppError('User authentication is required.', 401);
+    }
+
+    const { batchId } = uploadProgressParamsSchema.parse(req.params);
+    const result = await this.adminService.getUploadProgress(adminUserId, batchId);
+
+    res.status(200).json({
+      success: true,
       data: result
     });
   };

@@ -41,14 +41,23 @@ create table if not exists knowledge_upload_batches (
   file_name text,
   file_type text,
   total_rows int default 0,
+  processed_rows int default 0,
   success_count int default 0,
   failed_count int default 0,
   skipped_count int default 0,
-  status text default 'processing',
+  progress_percentage int default 0,
+  status text default 'processing' check (status in ('processing', 'completed', 'failed')),
   error_message text,
   created_at timestamptz default now(),
   completed_at timestamptz
 );
+
+alter table knowledge_upload_batches add column if not exists processed_rows int default 0;
+alter table knowledge_upload_batches add column if not exists progress_percentage int default 0;
+alter table knowledge_upload_batches drop constraint if exists knowledge_upload_batches_status_check;
+alter table knowledge_upload_batches
+add constraint knowledge_upload_batches_status_check
+check (status in ('processing', 'completed', 'failed'));
 
 create table if not exists knowledge_documents (
   id bigserial primary key,

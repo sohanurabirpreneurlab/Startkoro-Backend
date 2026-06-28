@@ -1,9 +1,8 @@
 import { Express } from 'express';
 import {
-  KnowledgeUploadResult,
+  KnowledgeUploadStartResult,
   ParsedKnowledgeRow,
-  UploadFailedRow,
-  UploadSkippedRow
+  UploadProgressResult
 } from '../interfaces/admin-upload.interface';
 import { DocumentChunkRepository } from '../repositories/document-chunk.repository';
 import { KnowledgeRepository } from '../repositories/knowledge.repository';
@@ -14,6 +13,7 @@ import { buildKnowledgeChunkText, normalizeKnowledgeQuestion } from '../utils/kn
 import { EmbeddingService } from './embedding.service';
 import { ExcelParserService } from './excel-parser.service';
 import { ISafeUser, IUser } from '../interfaces/user.interface';
+import { IKnowledgeDocument } from '../interfaces/knowledge-document.interface';
 
 const MAX_UPLOAD_ROWS = 500;
 
@@ -44,116 +44,168 @@ export class AdminService {
   async uploadKnowledgeFile(
     adminUserId: string,
     file: Express.Multer.File
-  ): Promise<KnowledgeUploadResult> {
-    // Batch tracking gives admins a durable summary even when large uploads contain mixed outcomes.
+  ): Promise<KnowledgeUploadStartResult> {
+    // The upload HTTP request should finish quickly. Embeddings can take much longer,
+    // so we parse and validate synchronously, then return a batch id for polling.
+    const rows = this.excelParserService.parseKnowledgeFile(file.buffer, file.originalname);
+
+    if (rows.length === 0) {
+      throw new AppError('The uploaded file does not contain any knowledge rows.', 400);
+    }
+
+    if (rows.length > MAX_UPLOAD_ROWS) {
+      throw new AppError(`Upload row limit exceeded. Maximum allowed rows is ${MAX_UPLOAD_ROWS}.`, 400);
+    }
+
+    // Progress lives in knowledge_upload_batches so polling stays resilient across retries,
+    // reloads, and long-running background work.
     const batch = await this.uploadBatchRepository.createBatch({
       uploaded_by: adminUserId,
       file_name: file.originalname,
       file_type: file.mimetype || null,
+      total_rows: rows.length,
+      processed_rows: 0,
+      success_count: 0,
+      failed_count: 0,
+      skipped_count: 0,
+      progress_percentage: 0,
       status: 'processing'
     });
 
-    try {
-      // We parse directly from the in-memory buffer so the server can discard the source file
-      // immediately after processing instead of persisting upload artifacts for the MVP.
-      const rows = this.excelParserService.parseKnowledgeFile(file.buffer, file.originalname);
+    // setImmediate is the lightest MVP background handoff here. It lets the API respond
+    // with the batch id before expensive row processing and embedding generation begin.
+    setImmediate(() => {
+      this.processKnowledgeRowsInBackground(batch.id, adminUserId, rows).catch(async (error) => {
+        const message = error instanceof Error ? error.message : 'Knowledge upload processing failed.';
 
-      if (rows.length > MAX_UPLOAD_ROWS) {
-        throw new AppError(`Upload row limit exceeded. Maximum allowed rows is ${MAX_UPLOAD_ROWS}.`, 400);
-      }
+        console.error('Knowledge upload batch failed:', {
+          batchId: batch.id,
+          adminUserId,
+          error
+        });
 
-      const skippedRows: UploadSkippedRow[] = [];
-      const failedRows: UploadFailedRow[] = [];
-      let successCount = 0;
+        await this.uploadBatchRepository.markFailed(batch.id, message);
+      });
+    });
 
-      for (const row of rows) {
-        try {
-          const didCreateKnowledge = await this.processKnowledgeRow(batch.id, adminUserId, row, skippedRows);
+    return {
+      batchId: batch.id
+    };
+  }
 
-          if (didCreateKnowledge) {
-            successCount += 1;
-          }
-        } catch (error) {
-          // Row-by-row processing keeps a single bad row from wasting the entire upload batch.
-          failedRows.push({
-            rowNumber: row.rowNumber,
-            question: row.question || undefined,
-            reason: error instanceof Error ? error.message : 'Unexpected processing error.'
-          });
+  async processKnowledgeRowsInBackground(
+    batchId: string,
+    adminUserId: string,
+    rows: ParsedKnowledgeRow[]
+  ): Promise<void> {
+    const totalRows = rows.length;
+    let processedRows = 0;
+    let successCount = 0;
+    let failedCount = 0;
+    let skippedCount = 0;
+
+    for (const row of rows) {
+      try {
+        const outcome = await this.processKnowledgeRow(batchId, adminUserId, row);
+
+        if (outcome === 'success') {
+          successCount += 1;
+        } else {
+          skippedCount += 1;
         }
+      } catch (_error) {
+        // One bad row should not fail the entire batch. We keep moving and reflect the failure in counts.
+        failedCount += 1;
       }
 
-      await this.uploadBatchRepository.updateBatch(batch.id, {
-        total_rows: rows.length,
+      processedRows += 1;
+
+      const progressPercentage = Math.round((processedRows / totalRows) * 100);
+
+      await this.uploadBatchRepository.updateBatch(batchId, {
+        processed_rows: processedRows,
         success_count: successCount,
-        skipped_count: skippedRows.length,
-        failed_count: failedRows.length,
-        status: 'completed',
-        completed_at: new Date().toISOString()
+        failed_count: failedCount,
+        skipped_count: skippedCount,
+        progress_percentage: progressPercentage,
+        status: processedRows === totalRows ? 'completed' : 'processing'
       });
-
-      return {
-        batchId: batch.id,
-        totalRows: rows.length,
-        successCount,
-        skippedCount: skippedRows.length,
-        failedCount: failedRows.length,
-        skippedRows,
-        failedRows
-      };
-    } catch (error) {
-      await this.uploadBatchRepository.updateBatch(batch.id, {
-        status: 'failed',
-        error_message: error instanceof Error ? error.message : 'Upload failed.',
-        completed_at: new Date().toISOString()
-      });
-
-      throw error;
     }
+
+    await this.uploadBatchRepository.markCompleted(batchId, {
+      total_rows: totalRows,
+      processed_rows: processedRows,
+      success_count: successCount,
+      failed_count: failedCount,
+      skipped_count: skippedCount,
+      progress_percentage: 100,
+      completed_at: new Date().toISOString()
+    });
+  }
+
+  async getUploadProgress(adminUserId: string, batchId: string): Promise<UploadProgressResult> {
+    // The current auth model exposes only the admin role. Until a dedicated super-admin role exists,
+    // admins may only read batches they created.
+    const batch = await this.uploadBatchRepository.findByIdAndUserId(batchId, adminUserId);
+
+    if (!batch) {
+      throw new AppError('Upload batch not found.', 404);
+    }
+
+    return {
+      batchId: batch.id,
+      status: batch.status,
+      totalRows: batch.total_rows,
+      processedRows: batch.processed_rows,
+      successCount: batch.success_count,
+      failedCount: batch.failed_count,
+      skippedCount: batch.skipped_count,
+      progressPercentage: batch.progress_percentage,
+      errorMessage: batch.error_message
+    };
   }
 
   private async processKnowledgeRow(
     batchId: string,
     adminUserId: string,
-    row: ParsedKnowledgeRow,
-    skippedRows: UploadSkippedRow[]
-  ): Promise<boolean> {
+    row: ParsedKnowledgeRow
+  ): Promise<'success' | 'skipped'> {
     const question = row.question.trim();
     const answer = row.answer.trim();
 
     if (!question || !answer) {
-      skippedRows.push({
-        rowNumber: row.rowNumber,
-        question: question || undefined,
-        reason: 'Question or answer is empty.'
-      });
-      return false;
+      return 'skipped';
     }
 
     const normalizedQuestion = normalizeKnowledgeQuestion(question);
     const existingDocument = await this.knowledgeRepository.findByNormalizedQuestion(normalizedQuestion);
 
     if (existingDocument) {
-      // Duplicate questions are skipped so retrieval stays deterministic and the admin gets a clear report.
-      skippedRows.push({
-        rowNumber: row.rowNumber,
-        question,
-        reason: 'Duplicate question'
-      });
-      return false;
+      // Duplicate questions are skipped so retrieval stays deterministic across repeated uploads.
+      return 'skipped';
     }
 
     const title = row.title?.trim() || question.slice(0, 120);
-    const document = await this.knowledgeRepository.createKnowledgeDocument({
-      title,
-      source_type: 'excel_csv_upload',
-      original_question: question,
-      original_answer: answer,
-      normalized_question: normalizedQuestion,
-      status: 'ready',
-      uploaded_by: adminUserId,
-      batch_id: batchId
-    });
+    let document: IKnowledgeDocument;
+
+    try {
+      document = await this.knowledgeRepository.createKnowledgeDocument({
+        title,
+        source_type: 'excel_csv_upload',
+        original_question: question,
+        original_answer: answer,
+        normalized_question: normalizedQuestion,
+        status: 'ready',
+        uploaded_by: adminUserId,
+        batch_id: batchId
+      });
+    } catch (error) {
+      if (error instanceof AppError && error.statusCode === 409) {
+        return 'skipped';
+      }
+
+      throw error;
+    }
 
     try {
       // We embed question + answer together because retrieval should return the exact answer context
@@ -181,7 +233,7 @@ export class AdminService {
       throw error;
     }
 
-    return true;
+    return 'success';
   }
 
   private toSafeUser(user: IUser): ISafeUser {
