@@ -99,4 +99,42 @@ export class UserRepository {
       throw new AppError('Failed to update user role.', 500, error);
     }
   }
+
+  async updateProfile(
+    userId: string,
+    payload: Pick<IUser, 'name' | 'email' | 'address'>
+  ): Promise<IUser> {
+    try {
+      const result = await db.query<IUser>(
+        `
+          update users
+          set
+            name = $2,
+            email = $3,
+            address = $4
+          where id = $1
+          returning *
+        `,
+        [userId, payload.name, payload.email, payload.address]
+      );
+
+      const user = result.rows[0];
+
+      if (!user) {
+        throw new AppError('User not found.', 404);
+      }
+
+      return user;
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+
+      if ((error as { code?: string }).code === '23505') {
+        throw new AppError('A user with this email already exists.', 409);
+      }
+
+      throw new AppError('Failed to update user profile.', 500, error);
+    }
+  }
 }

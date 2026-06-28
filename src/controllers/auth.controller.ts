@@ -18,6 +18,12 @@ const loginSchema = z.object({
   password: z.string().min(6).max(128)
 });
 
+const updateProfileSchema = z.object({
+  name: z.string().trim().min(2).max(100),
+  email: z.string().trim().email(),
+  address: z.string().trim().min(5).max(255)
+});
+
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
@@ -68,6 +74,23 @@ export class AuthController {
     res.status(200).json({
       success: true,
       data: this.authService.toSafeUser(user)
+    });
+  };
+
+  updateMe = async (req: IAuthenticatedRequest, res: Response): Promise<void> => {
+    const userId = req.user?.sub;
+
+    if (!userId) {
+      throw new AppError('Authenticated user was not found in the request.', 401);
+    }
+
+    const payload = updateProfileSchema.parse(req.body);
+    const updatedUser = await this.userService.updateProfile(userId, payload);
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully.',
+      data: this.authService.toSafeUser(updatedUser)
     });
   };
 }

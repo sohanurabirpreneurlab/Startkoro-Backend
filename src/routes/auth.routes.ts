@@ -9,6 +9,7 @@ export const createAuthRoutes = (authController: AuthController): Router => {
   router.post('/register', asyncHandler(authController.register));
   router.post('/login', asyncHandler(authController.login));
   router.get('/me', authMiddleware, asyncHandler(authController.me));
+  router.patch('/me', authMiddleware, asyncHandler(authController.updateMe));
 
   return router;
 };
