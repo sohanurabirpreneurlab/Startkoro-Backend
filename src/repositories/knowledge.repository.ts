@@ -61,7 +61,16 @@ export class KnowledgeRepository {
   async listKnowledgeDocuments(): Promise<IKnowledgeDocument[]> {
     try {
       const result = await db.query<IKnowledgeDocument>(
-        'select * from knowledge_documents order by created_at desc'
+        `
+          select
+            knowledge_documents.*,
+            document_chunks.metadata->>'category' as category
+          from knowledge_documents
+          left join document_chunks
+            on document_chunks.document_id = knowledge_documents.id
+            and document_chunks.chunk_index = 0
+          order by knowledge_documents.created_at desc
+        `
       );
       return result.rows;
     } catch (error) {

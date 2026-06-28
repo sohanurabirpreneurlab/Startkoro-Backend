@@ -4,6 +4,7 @@ export interface IKnowledgeDocument {
   source_type: string;
   original_question: string | null;
   original_answer: string | null;
+  category?: string | null;
   normalized_question: string | null;
   status: 'draft' | 'ready' | 'archived';
   uploaded_by: string | null;
